@@ -41,7 +41,7 @@ It serves the OpenAI-compatible HTTP API on `http://<host>:<port>`:
 
 | Option | Description |
 | --- | --- |
-| `--preset <name>` | Pre-configured model + context. `lfm2.5` (default), `qwen36-35b-q4`, `qwen36-35b-q4xl`, `qwen36-35b-q8`, `qwen36-27b-q4` - see [Qwen3.6 presets](#qwen36-presets-1m-context). Explicit flags (`--model`, `--ctx-size`, ...) still win over preset values. |
+| `--preset <name>` | Pre-configured model + context. `lfm2.5` (default), `qwen36-35b-q4`, `qwen36-35b-q4xl`, `qwen36-35b-q8`, `qwen36-27b-q4`, plus the native 1M presets `llama4-scout-q4`, `glm-5.3-flash-iq1`, `kimi-linear-48b-q4` - see [Qwen3.6 presets](#qwen36-presets-1m-context) and [Native 1M-context presets](#native-1m-context-presets). Explicit flags (`--model`, `--ctx-size`, ...) still win over preset values. |
 | `--model <path>` | Path to the model `.gguf` file. **Optional** — defaults to Liquid AI LFM2.5-8B-A1B Q8_0 at 128 000-token context (`~/data/models/lfm2.5-8b-a1b-q8_0/LFM2.5-8B-A1B-Q8_0.gguf`), downloaded on first use. If the given path does not exist yet and `--hf-repo` is set, it is downloaded first. Files already present in the Hugging Face hub cache (`~/.cache/huggingface/hub/models--*`) are reused without re-downloading. |
 | `--hf-repo <repo_id>` | Hugging Face repo that holds the `.gguf` (e.g. `LiquidAI/LFM2.5-8B-A1B-GGUF`). Used to download `--model` when missing. |
 | `--hf-file <name>` | Filename to download from `--hf-repo`. Defaults to the basename of `--model`. |
@@ -108,11 +108,15 @@ of it exists. The presets use its open siblings, published by Qwen
 All presets: **single slot** (`--parallel 1`). The 35B presets quantize the
 KV cache to `q8_0`.
 
+MTP variants (`unsloth/Qwen3.6-35B-A3B-MTP-GGUF`) exist and this build has
+MTP support, but they are deliberately not preset: different repo, and
+speculative decoding changes benchmark comparability.
+
 > **1M context is not currently effective.** The script targets 1 048 576
 > tokens via YaRN (factor 4) and wires the flags when `--ctx-size` exceeds
 > 262 144, but llama-server caps the slot context at the model's training
 > context, so the effective context is 262 144. This is deliberate upstream
-> behavior (issue #22140, closed as not planned); re-check after updating
+> behavior (issues #22140 and #17459, closed as not planned); re-check after updating
 > llama.cpp, or run `--ctx-size 1048576 --port 8081` and look for the
 > `capping` warning to see if it still applies.
 
@@ -179,6 +183,14 @@ Notes:
   the preset.
 - MiniMax-M3 (1M ctx, 230B/10B) was evaluated and rejected: its smallest
   quant (UD-IQ1_M) is 119.6 GiB, leaving no room for KV + buffers on 128 GB.
+- Llama 4 Maverick was rejected outright: Q4_K_M is ~245 GB and even a 1-bit
+  quant is ~114 GiB - impossible on 128 GB.
+- DeepSeek V4-Flash was rejected: 1-bit weights alone are ~87+ GiB and its
+  better quants need the dspark fork, unsupported in this repo.
+- Kimi-Linear's compressed KV uses 72-dim heads, so `q8_0` KV fails with
+  "V cache type q8_0 with block size 32 does not divide n_embd_head_v=72";
+  the preset pins f16 (q8_0 KV needs head_dim divisible by 32). Apply the
+  same rule to any preset that fails this way.
 - Gemma 4 tops out at 256K native context - no Gemma model does 1M.
 
 ## Kimi-Linear-48B-A3B deep dive
@@ -227,8 +239,7 @@ it as a local provider:
 // ~/.config/opencode/opencode.json (provider entry)
 "llamacpp": {
   "npm": "@ai-sdk/openai-compatible",
-  "name": "llama.cpp (local Kimi-Linear)",
-  "options": { "baseURL": "http://127.0.0.1:8000/v1" },
+  "name": "llama.cpp (local Kimi-Linear)",      "options": { "baseURL": "http://macbook:8000/v1" },
   "models": {
     "kimi-linear-48b": { "name": "Kimi-Linear-48B-A3B (local, 1M ctx)" }
   }
@@ -297,8 +308,48 @@ Measured against this server (llama.cpp build b10326, Metal, full offload):
 | Generation | **221.2 t/s** |
 
 For comparison, the vLLM Metal server reaches ~24 tok/s on Mistral-Nemo-12B
-Q8_0 — the LFM MoE + native Metal path is roughly an order of magnitude
+Q8_0 - the LFM MoE + native Metal path is roughly an order of magnitude
 faster on generation. Generation comfortably exceeds human reading speed.
+
+## Real-world opencode session over LAN (2026-09-23)
+
+opencode ran on another machine (192.168.50.1) against this server
+(`kimi-linear-48b-q4` preset, 1M slot), reached via an /etc/hosts alias.
+What the server log showed:
+
+- **First turn looks like a hang but is a cold prefill.** opencode
+  submitted a 110 016-token prompt (system prompt + tool definitions +
+  conversation history). The slot prefilled all of it in ~387 s (~284 t/s
+  average; ~2000 t/s at 8K tokens declining to ~300 t/s near 110K) and only
+  then started decoding. Until prefill finished, the opencode TUI just
+  flashed its progress indicator with zero output.
+- **Follow-up turns are fast because of the KV prefix cache.** The next
+  turn prefilled only ~2.1K tokens in ~11 s (slot reuse by LCP similarity,
+  f_sim_best = 0.936), then decoded ~1292 tokens at ~28 t/s. RSS held
+  steady at ~37 GB; nothing truncated, no errors.
+
+Speed comparison with the hosted model that authored this doc (Freebuff
+session; no token/s instrumentation on that side, so qualitative):
+
+| Path | Time to first token | Sustained output | Context ceiling |
+| --- | --- | --- | --- |
+| llama.cpp Kimi 48B, short context (measured) | ~0.3 s round trip | ~118 t/s | 1 048 576 |
+| llama.cpp Kimi 48B, 110K-token cold prompt (measured) | ~6.5 min prefill | ~28 t/s decode | 1 048 576 |
+| Freebuff hosted session (not instrumented) | seconds per reply, no visible cold prefill | comparable interactive feel | provider window |
+
+Reading: at short context the local stack beats typical hosted-API
+streaming, costs nothing, and keeps data on-machine. The price is the cold
+prefill of a huge first prompt, proportional to prompt size - hosted
+services hide this because their serving stack keeps sessions warm. A warm
+local session flips it back: cached prefix, no network, no meter.
+
+Practical tips for opencode use:
+
+- A flashing progress indicator with no output on turn one means prefill,
+  not a hang. Confirm in the server log: "prompt processing, progress =".
+- Keep turn-1 payloads small; let the agent read files as it needs them.
+- Keep unrelated work in separate sessions so LCP slot reuse keeps hitting
+  the prefix cache (all sessions share the one slot of `--parallel 1`).
 
 ## Reasoning / thinking behavior
 
@@ -446,6 +497,55 @@ launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.omlx.server.plist`
 - but do not run both servers with models resident at the same time
 (one-LLM-at-a-time rule: loading two large models can panic the machine).
 
+## Session history (2026-09-22/23) and model re-downloads
+
+Condensed from the working handoff notes (HANDOFF.md, removed after this
+merge):
+
+- 2026-09-22: added the `--preset` flag and the four qwen36 presets;
+  downloaded all files with a resumable curl loop; verified each with
+  `--test`; benched all four at 262K. The task then pivoted to 1M-context
+  models: downloaded Llama 4 Scout Q4_K_M, GLM-5.3-Flash IQ1_M and
+  Kimi-Linear Q4_K_M; tested and benched each strictly one at a time
+  (one-LLM rule). Kimi-Linear won: fastest decode (118 t/s) and lightest
+  footprint (36.4 GB RSS) of the true-1M candidates.
+- 2026-09-23: user picked `kimi-linear-48b-q4`; the service was installed on
+  port 8000, displacing `com.omlx.server` (see "Current service" above).
+  GLM-5.3-Flash files (~95 GB) stay on disk until the upstream `glm5next`
+  support PR lands in llama.cpp - unusable here before that.
+
+Model sources, all `curl -C -` resumable. Verify the byte size before
+loading - a truncated GGUF fails at load time:
+
+| Model | URL (huggingface.co/...) | Expected bytes |
+| --- | --- | --- |
+| Kimi-Linear 48B Q4_K_M | `bartowski/moonshotai_Kimi-Linear-48B-A3B-Instruct-GGUF/resolve/main/moonshotai_Kimi-Linear-48B-A3B-Instruct-Q4_K_M.gguf` | 30 061 058 720 |
+| Llama 4 Scout Q4_K_M | `bartowski/meta-llama_Llama-4-Scout-17B-16E-Instruct-GGUF/resolve/main/meta-llama_Llama-4-Scout-17B-16E-Instruct-Q4_K_M/meta-llama_Llama-4-Scout-17B-16E-Instruct-Q4_K_M-0000{1,2}-of-00002.gguf` | 39 837 275 008 + 27 708 903 776 |
+| GLM-5.3-Flash IQ1_M | `unsloth/GLM-5.3-Flash-GGUF/resolve/main/UD-IQ1_M/GLM-5.3-Flash-UD-IQ1_M-0000{1,2,3}-of-00003.gguf` | 9 429 859 + 49 996 246 592 + 47 573 668 096 |
+| Qwen3.6-27B Q4_K_M | `unsloth/Qwen3.6-27B-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf` | 16 817 244 384 |
+| Qwen3.6-35B UD-Q4_K_XL | `unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` | 22 360 456 160 |
+| Qwen3.6-35B Q8_0 | `unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-Q8_0.gguf` | 36 903 140 320 |
+
+(An older note claimed 22 853 663 008 for the XL; the upstream file is the
+smaller size above and loads fine.) Files already in the HF hub cache are
+reused automatically by the script.
+
+Operational notes carried from the same sessions:
+
+- A backgrounded download from a non-interactive shell gets killed when the
+  shell exits (`nohup` does not survive either). Long downloads need a
+  launchd agent wrapper, or a terminal you keep open. The loop used here:
+  `curl -sL -C - --fail --retry 3 --retry-delay 5 --speed-time 30
+  --speed-limit 10240` repeated until the size matches, logging to
+  `<dest>.dl.log`.
+- While a long-lived service occupies port 8000, test new presets on
+  `--port 8081`.
+- `--status` only reports what `pgrep` finds; a llama-server running on a
+  different port is invisible to it.
+- `gguf-py` is unusable on this machine (no numpy in the system pythons).
+  Parse GGUF headers with a pure-python struct reader; do not pip install
+  into the system python.
+
 ## Troubleshooting
 
 ### Port already in use
@@ -475,3 +575,9 @@ the cache.
 
 Same as the vLLM service: the `gui` domain only exists while a user is logged
 in at the Mac's display. Log in at the screen, then re-run `--install-service`.
+
+### huggingface.co TLS failures (router DNS interception)
+
+The router intermittently intercepts huggingface.co with a `*.eero.com`
+certificate; curl fails with TLS error 60 or "error 000". `curl --retry 3`
+usually gets through; `hf-mirror.com` is a fallback mirror.
