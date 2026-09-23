@@ -17,10 +17,13 @@ It serves the OpenAI-compatible HTTP API on `http://<host>:<port>`:
 
 ```bash
 # Default model (Liquid AI LFM2.5-8B-A1B Q8_0, native 128 000-token context)
-# — auto-downloaded on first use:
+# - auto-downloaded on first use:
 ./llamacpp-server.sh
 
-# Qwen3.6-35B-A3B at 1M context (single slot, YaRN rope scaling):
+# Current service model: Kimi-Linear-48B-A3B at native 1M context:
+./llamacpp-server.sh --preset kimi-linear-48b-q4
+
+# Qwen3.6-35B-A3B at 262K context (single slot, YaRN rope scaling):
 ./llamacpp-server.sh --preset qwen36-35b-q4
 
 # Model already on disk:
@@ -41,16 +44,16 @@ It serves the OpenAI-compatible HTTP API on `http://<host>:<port>`:
 
 | Option | Description |
 | --- | --- |
-| `--preset <name>` | Pre-configured model + context. `lfm2.5` (default), `qwen36-35b-q4`, `qwen36-35b-q4xl`, `qwen36-35b-q8`, `qwen36-27b-q4`, plus the native 1M presets `llama4-scout-q4`, `glm-5.3-flash-iq1`, `kimi-linear-48b-q4` - see [Qwen3.6 presets](#qwen36-presets-1m-context) and [Native 1M-context presets](#native-1m-context-presets). Explicit flags (`--model`, `--ctx-size`, ...) still win over preset values. |
+| `--preset <name>` | Pre-configured model + context. `lfm2.5` (default), `qwen36-35b-q4`, `qwen36-35b-q4xl`, `qwen36-35b-q8`, `qwen36-27b-q4`, plus the native 1M presets `llama4-scout-q4`, `glm-5.3-flash-iq1`, `kimi-linear-48b-q4` - see [Qwen3.6 presets](#qwen36-presets-262k-context) and [Native 1M-context presets](#native-1m-context-presets). Explicit flags (`--model`, `--ctx-size`, ...) still win over preset values. |
 | `--model <path>` | Path to the model `.gguf` file. **Optional** — defaults to Liquid AI LFM2.5-8B-A1B Q8_0 at 128 000-token context (`~/data/models/lfm2.5-8b-a1b-q8_0/LFM2.5-8B-A1B-Q8_0.gguf`), downloaded on first use. If the given path does not exist yet and `--hf-repo` is set, it is downloaded first. Files already present in the Hugging Face hub cache (`~/.cache/huggingface/hub/models--*`) are reused without re-downloading. |
 | `--hf-repo <repo_id>` | Hugging Face repo that holds the `.gguf` (e.g. `LiquidAI/LFM2.5-8B-A1B-GGUF`). Used to download `--model` when missing. |
 | `--hf-file <name>` | Filename to download from `--hf-repo`. Defaults to the basename of `--model`. |
-| `--port <port>` | Port to listen on. Default: `8080`. (The vLLM server uses `8000`, so the two can run side by side.) |
+| `--port <port>` | Port to listen on. Default: `8080`. The installed llama.cpp service currently uses `8000`; the vLLM and oMLX alternates also live there - only one server can own the port, and only one model may be loaded machine-wide. |
 | `--ctx-size <n>` | Size of the prompt context (tokens). Default: `0` = loaded from the model (128 000 for the default model). With N slots the per-slot context is ctx-size / N. |
 | `--gpu-layers <n\|all>` | Layers to offload to VRAM. Default: `all` (full Metal offload on Apple Silicon). |
 | `--flash-attn <on\|off\|auto>` | Flash attention use. Default: `auto`. |
-| `--parallel <n>` | Number of parallel server slots. Default: `2`, or `1` for the qwen36 presets (the full 1M context goes into one slot). |
-| `--cache-type-k <type>` | KV cache quantization for K (e.g. `q8_0`). The 35B-A3B presets default to `q8_0` to halve the 1M-token KV cache. |
+| `--parallel <n>` | Number of parallel server slots. Default: `2`, or `1` for the qwen36 and native-1M presets (the full context goes into one slot). |
+| `--cache-type-k <type>` | KV cache quantization for K (e.g. `q8_0`). The 35B-A3B presets default to `q8_0` to halve the 256K-token KV cache; the `kimi-linear-48b-q4` preset pins f16 (its 72-dim compressed heads are incompatible with q8_0 blocks). |
 | `--cache-type-v <type>` | KV cache quantization for V (e.g. `q8_0`). |
 | `--bench [N]` | Profile: start the server, send one long prefill (default 8192 tokens) plus a 256-token generation, print prefill/decode tok/s and process memory, then stop the server. A pre-existing server on the port is profiled in place and left running. Use for A/B comparison of presets: `for p in qwen36-35b-q4 qwen36-35b-q4xl qwen36-35b-q8 qwen36-27b-q4; do ./llamacpp-server.sh --preset "$p" --bench; done` |
 | `--reasoning <on\|off\|auto>` | Use reasoning/thinking in chat. Default: `auto` — the default model emits chain-of-thought before answering. |
@@ -62,6 +65,10 @@ It serves the OpenAI-compatible HTTP API on `http://<host>:<port>`:
 | `-h, --help` | Show help. |
 
 ## Why the default model: Liquid AI LFM2.5-8B-A1B
+
+(2026-09-23: LFM2.5 remains the script default for quick ad-hoc runs, but the
+persistent service now runs Kimi-Linear-48B-A3B - see
+[Native 1M-context presets](#native-1m-context-presets).)
 
 The reference analysis in `~/repos/share/docs/lfms-vs-orinth.md` concludes that
 Liquid AI LFM models are the right fit for long-context local hosting on this
@@ -165,7 +172,7 @@ slot cap (n_ctx_train) does not bite. All three use compressed attention
 (chunked SWA, sparse/linear hybrid, or MLA) so the KV cache stays affordable
 at 1M tokens. Verified GGUF metadata and repo file sizes:
 
-| Preset | Model | Weights | KV @ 1M (q8_0) | Wired total |
+| Preset | Model | Weights | KV @ 1M | Wired total |
 | --- | --- | --- | --- | --- |
 | `llama4-scout-q4` | Llama 4 Scout 17B-16E Q4_K_M (bartowski), 2 shards | 61.7 GiB | ~25 GB (12 full-attn layers of 48; 36 are 8192-token chunked SWA) | ~90 GB |
 | `glm-5.3-flash-iq1` | GLM-5.3-Flash 320B-A18B IQ1_M (unsloth), 3 shards | 84.7 GiB | ~10 GB (hybrid sparse + linear attention) | ~100 GB, tight |
@@ -236,12 +243,18 @@ The server is a drop-in OpenAI-compatible endpoint, so OpenCode CLI can use
 it as a local provider:
 
 ```jsonc
-// ~/.config/opencode/opencode.json (provider entry)
+// ~/.config/opencode/opencode.jsonc (provider entry)
 "llamacpp": {
   "npm": "@ai-sdk/openai-compatible",
-  "name": "llama.cpp (local Kimi-Linear)",      "options": { "baseURL": "http://macbook:8000/v1" },
+  "name": "llama.cpp (local Kimi-Linear)",
+  "options": { "baseURL": "http://macbook:8000/v1" },
   "models": {
-    "kimi-linear-48b": { "name": "Kimi-Linear-48B-A3B (local, 1M ctx)" }
+    "Kimi-Linear-48B-A3B": {
+      "id": "/Users/user01macbook377/data/models/kimi-linear-48b-a3b-q4_k_m/Kimi-Linear-48B-A3B-Instruct-Q4_K_M.gguf",
+      "name": "Kimi Linear 48B A3B (llama.cpp, 1M ctx)",
+      "tool_call": true,
+      "limit": { "context": 1000000, "output": 32768 }
+    }
   }
 }
 ```
@@ -384,7 +397,7 @@ a long multi-turn session pays the full prefill only once, then each new turn
 only prefills its newly-appended tokens.
 
 The cache lives in the server process and dies on restart. Session length is
-still bounded by `--ctx-size` (default: the model's 128 000).
+still bounded by `--ctx-size` (default: the model's native context).
 
 ## Self-test (`--test`)
 
@@ -467,8 +480,9 @@ Notes:
 - `--test` in `llamacpp-server.sh` automates step 2 (readiness + one short
   prompt) and prints `PASS`/`FAIL`.
 - From another machine on your LAN, replace `127.0.0.1` with the Mac's LAN
-  IP. The Mac's firewall must allow the `llama-server` binary through — run
-  `llamacpp-server.sh` once in an interactive terminal so it can add the rule.
+  IP or the `macbook` /etc/hosts alias. The macOS firewall already has an
+  allow rule for `llama-server` (added by earlier interactive runs of
+  `llamacpp-server.sh`).
 
 ## Service install (`--install-service`)
 
@@ -566,10 +580,12 @@ A tight `max_tokens` budget can end the response during thinking, leaving
 
 ### Slow first response on a long context
 
-A cold prefill of a 128K prompt takes a while (prompt processing is ~520 t/s,
-so ~250s for a full 128K context). Subsequent turns reuse the cached prefix
-KV and only prefill the newly-appended tokens. Restarting the server drops
-the cache.
+A cold prefill of a long prompt takes a while, and throughput declines as
+the context fills. Measured on this machine: ~520 t/s for LFM2.5-8B at 128K
+(~250s), ~284 t/s average for Kimi-Linear-48B at 110K (~6.5 min, declining
+from ~2000 t/s at short positions to ~300 t/s near the end - see the LAN
+session report above). Subsequent turns reuse the cached prefix KV and only
+prefill the newly-appended tokens. Restarting the server drops the cache.
 
 ### `--install-service` fails over SSH after a reboot
 
