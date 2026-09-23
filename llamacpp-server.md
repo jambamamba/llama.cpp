@@ -587,6 +587,34 @@ from ~2000 t/s at short positions to ~300 t/s near the end - see the LAN
 session report above). Subsequent turns reuse the cached prefix KV and only
 prefill the newly-appended tokens. Restarting the server drops the cache.
 
+### Prompt larger than the context size (HTTP 422)
+
+The server rejects oversized prompts before doing any compute. When the
+prompt token count reaches the slot's context (1 048 576 for the Kimi
+service), the request fails fast with HTTP 422:
+
+```json
+{"error": {"message": "request (N tokens) exceeds the available context size
+(1048576 tokens), try increasing it", "type": "exceed_context_size_error"}}
+```
+
+- The slot is released cleanly; nothing is truncated, no context shift
+  happens (that needs an explicit context-shift flag this service does not
+  use), and other requests are unaffected. A >1M prompt costs ~0 ms and no
+  memory spike.
+- With `"cache_prompt": false` the check is strict `>` instead of `>=`, so a
+  prompt of exactly n_ctx is accepted with zero room for output tokens.
+- With `"stream": true` (and `include_usage`), the same error arrives as a
+  JSON chunk inside the stream rather than as a 422 status; clients must
+  parse stream chunks to see it.
+- opencode stays on the safe side by construction: its `limit.context`
+  1 000 000 + `limit.output` 32 768 = 1 032 768 fits inside the slot, and
+  oversized sessions trigger opencode's auto-compact before anything is
+  sent. The practical cost to watch is a prompt just *under* the limit: a
+  near-1M-token cold prefill takes far longer than the measured 6.5 min for
+  110K (prefill t/s decline with context) and monopolizes the single slot
+  while it runs.
+
 ### `--install-service` fails over SSH after a reboot
 
 Same as the vLLM service: the `gui` domain only exists while a user is logged
